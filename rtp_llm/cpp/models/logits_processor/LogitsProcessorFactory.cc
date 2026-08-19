@@ -3,6 +3,7 @@
 #include <cctype>
 #include <mutex>
 #include <optional>
+#include <sstream>
 
 #include "autil/legacy/any.h"
 #include "autil/legacy/json.h"
@@ -23,11 +24,82 @@ namespace rtp_llm {
 
 namespace {
 
-using JsonMap = autil::legacy::json::JsonMap;
+using JsonMap   = autil::legacy::json::JsonMap;
 using JsonArray = autil::legacy::json::JsonArray;
 
 std::mutex            g_grammar_backend_mutex;
 XGrammarBackendCppPtr g_grammar_backend;
+
+struct PretokenizedChatConstraints {
+    std::vector<int32_t> reasoning_prompt_tail_token_ids;
+    std::vector<int32_t> response_prompt_tail_token_ids;
+    std::string          reasoning_structural_tag;
+    std::string          response_structural_tag;
+
+    bool configured() const {
+        return !reasoning_structural_tag.empty() || !response_structural_tag.empty();
+    }
+};
+
+PretokenizedChatConstraints g_pretokenized_chat_constraints;
+
+bool inputEndsWith(const torch::Tensor& input_ids, const std::vector<int32_t>& suffix) {
+    if (suffix.empty() || !input_ids.defined() || !input_ids.device().is_cpu()
+        || input_ids.scalar_type() != torch::kInt32 || input_ids.numel() < static_cast<int64_t>(suffix.size())) {
+        return false;
+    }
+    const auto  contiguous = input_ids.contiguous();
+    const auto* data       = contiguous.data_ptr<int32_t>();
+    const auto  offset     = contiguous.numel() - static_cast<int64_t>(suffix.size());
+    return std::equal(suffix.begin(), suffix.end(), data + offset);
+}
+
+std::string formatInputTail(const torch::Tensor& input_ids, size_t max_tokens) {
+    if (!input_ids.defined() || !input_ids.device().is_cpu() || input_ids.scalar_type() != torch::kInt32) {
+        return "unavailable";
+    }
+    const auto         contiguous = input_ids.contiguous();
+    const auto*        data       = contiguous.data_ptr<int32_t>();
+    const auto         count      = static_cast<size_t>(contiguous.numel());
+    const auto         begin      = count > max_tokens ? count - max_tokens : 0;
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = begin; i < count; ++i) {
+        if (i != begin) {
+            oss << ",";
+        }
+        oss << data[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string applyPretokenizedChatConstraint(std::shared_ptr<GenerateInput>     generate_input,
+                                            const PretokenizedChatConstraints& defaults) {
+    auto               config         = generate_input->generate_config;
+    const std::string* structural_tag = nullptr;
+    std::string        source;
+    if (inputEndsWith(generate_input->input_ids, defaults.reasoning_prompt_tail_token_ids)) {
+        structural_tag = &defaults.reasoning_structural_tag;
+        source         = "prompt_tail_reasoning";
+    } else if (inputEndsWith(generate_input->input_ids, defaults.response_prompt_tail_token_ids)) {
+        structural_tag = &defaults.response_structural_tag;
+        source         = "prompt_tail_response";
+    } else if (config->in_think_mode && !defaults.reasoning_structural_tag.empty()) {
+        structural_tag = &defaults.reasoning_structural_tag;
+        source         = "config_reasoning_fallback";
+    }
+    if (structural_tag == nullptr || structural_tag->empty()) {
+        return "none";
+    }
+
+    config->structural_tag      = *structural_tag;
+    config->in_think_mode       = false;
+    config->max_thinking_tokens = 0;
+    config->begin_think_token_ids.clear();
+    config->end_think_token_ids.clear();
+    return source;
+}
 
 std::string anyToString(const autil::legacy::Any& any) {
     if (auto str = autil::legacy::AnyCast<std::string>(&any)) {
@@ -141,7 +213,7 @@ BaseLogitsProcessorPtr createGrammarProcessor(std::shared_ptr<GenerateInput>    
                                               int64_t                               eos_token_id,
                                               const GrammarKeyCpp&                  key,
                                               LogitsProcessorFactory::ErrorReporter error_reporter) {
-    auto config = generate_input->generate_config;
+    auto                  config = generate_input->generate_config;
     XGrammarBackendCppPtr backend;
     {
         std::lock_guard<std::mutex> lock(g_grammar_backend_mutex);
@@ -177,10 +249,17 @@ BaseLogitsProcessorPtr createGrammarProcessor(std::shared_ptr<GenerateInput>    
         backend->setCache(key, compiled);
     }
 
-    const bool terminate_without_stop_token = key.key_type == "json";
+    const bool       terminate_without_stop_token = key.key_type == "json";
+    std::vector<int> request_stop_tokens;
+    for (const auto& stop_word : config->stop_words_list) {
+        if (stop_word.size() == 1) {
+            request_stop_tokens.push_back(stop_word[0]);
+        }
+    }
+    const auto request_stops = std::optional<std::vector<int>>(std::move(request_stop_tokens));
     if (config->in_think_mode) {
         auto matcher = backend->createMatcher(
-            compiled, /*require_reasoning=*/false, std::nullopt, terminate_without_stop_token);
+            compiled, /*require_reasoning=*/false, std::nullopt, terminate_without_stop_token, request_stops);
         return std::make_shared<ReasoningGrammarLogitsProcessor>(std::move(matcher),
                                                                  eos_token_id,
                                                                  config->max_thinking_tokens,
@@ -191,7 +270,7 @@ BaseLogitsProcessorPtr createGrammarProcessor(std::shared_ptr<GenerateInput>    
     }
 
     auto matcher = backend->createMatcher(
-        compiled, /*require_reasoning=*/false, std::nullopt, terminate_without_stop_token);
+        compiled, /*require_reasoning=*/false, std::nullopt, terminate_without_stop_token, request_stops);
     return std::make_shared<GrammarLogitsProcessor>(std::move(matcher), eos_token_id, std::move(error_reporter));
 }
 
@@ -204,13 +283,18 @@ void appendThinkProcessor(std::vector<BaseLogitsProcessorPtr>& result,
     }
 }
 
-void appendGrammarProcessor(std::vector<BaseLogitsProcessorPtr>&       result,
-                            std::shared_ptr<GenerateInput>             generate_input,
-                            int64_t                                    eos_token_id,
-                            const GrammarKeyCpp&                       grammar_key,
-                            LogitsProcessorFactory::ErrorReporter      error_reporter) {
+void appendGrammarProcessor(std::vector<BaseLogitsProcessorPtr>&  result,
+                            std::shared_ptr<GenerateInput>        generate_input,
+                            int64_t                               eos_token_id,
+                            const GrammarKeyCpp&                  grammar_key,
+                            LogitsProcessorFactory::ErrorReporter error_reporter) {
     auto grammar_processor = createGrammarProcessor(generate_input, eos_token_id, grammar_key, error_reporter);
     if (grammar_processor != nullptr) {
+        RTP_LLM_LOG_INFO("grammar processor created: request_id=%ld trace_id=%s key_type=%s input_len=%d",
+                         generate_input->request_id,
+                         generate_input->request_info.trace_id.c_str(),
+                         grammar_key.key_type.c_str(),
+                         generate_input->inputLength());
         result.push_back(std::move(grammar_processor));
     }
 }
@@ -247,6 +331,12 @@ void LogitsProcessorFactory::init(const std::string&   ckpt_path,
 
     std::lock_guard<std::mutex> lock(g_grammar_backend_mutex);
     g_grammar_backend.reset();
+    g_pretokenized_chat_constraints = {
+        grammar_config.reasoning_prompt_tail_token_ids,
+        grammar_config.response_prompt_tail_token_ids,
+        grammar_config.reasoning_structural_tag,
+        grammar_config.response_structural_tag,
+    };
 
     auto backend_name = grammar_config.grammar_backend;
     std::transform(backend_name.begin(), backend_name.end(), backend_name.begin(), [](unsigned char c) {
@@ -288,9 +378,55 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     std::vector<BaseLogitsProcessorPtr> result;
     auto                                config = generate_input->generate_config;
 
+    const bool   in_think_mode_before        = config->in_think_mode;
+    const size_t begin_think_ids_size_before = config->begin_think_token_ids.size();
+    const size_t end_think_ids_size_before   = config->end_think_token_ids.size();
+
     GrammarKeyCpp grammar_key;
+    std::string   constraint_source = "request";
     try {
         grammar_key = keyFromGenerateConfig(*config);
+        if (grammar_key.empty()) {
+            PretokenizedChatConstraints defaults;
+            {
+                std::lock_guard<std::mutex> lock(g_grammar_backend_mutex);
+                defaults = g_pretokenized_chat_constraints;
+            }
+            constraint_source = applyPretokenizedChatConstraint(generate_input, defaults);
+            if (constraint_source != "none") {
+                grammar_key = {"structural_tag", config->structural_tag.value()};
+            } else if (in_think_mode_before) {
+                constraint_source = "legacy_think";
+            }
+            if (defaults.configured() || in_think_mode_before) {
+                const size_t configured_tail_size = std::max(defaults.reasoning_prompt_tail_token_ids.size(),
+                                                             defaults.response_prompt_tail_token_ids.size());
+                RTP_LLM_LOG_INFO(
+                    "constraint selection: request_id=%ld trace_id=%s source=%s key_type=%s "
+                    "in_think_mode_before=%d in_think_mode_after=%d begin_think_ids=%zu end_think_ids=%zu "
+                    "input_len=%d input_tail_ids=%s",
+                    generate_input->request_id,
+                    generate_input->request_info.trace_id.c_str(),
+                    constraint_source.c_str(),
+                    grammar_key.key_type.empty() ? "none" : grammar_key.key_type.c_str(),
+                    in_think_mode_before,
+                    config->in_think_mode,
+                    begin_think_ids_size_before,
+                    end_think_ids_size_before,
+                    generate_input->inputLength(),
+                    formatInputTail(generate_input->input_ids, std::max<size_t>(8, configured_tail_size)).c_str());
+            }
+        } else {
+            RTP_LLM_LOG_INFO("constraint selection: request_id=%ld trace_id=%s source=request key_type=%s "
+                             "in_think_mode=%d begin_think_ids=%zu end_think_ids=%zu input_len=%d",
+                             generate_input->request_id,
+                             generate_input->request_info.trace_id.c_str(),
+                             grammar_key.key_type.c_str(),
+                             config->in_think_mode,
+                             config->begin_think_token_ids.size(),
+                             config->end_think_token_ids.size(),
+                             generate_input->inputLength());
+        }
     } catch (const std::exception& e) {
         if (error_reporter) {
             error_reporter(
