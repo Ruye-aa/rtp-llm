@@ -304,6 +304,38 @@ def parse_ds_header_attributes(request) -> dict[str, Any]:
     return {str(k).lower(): v for k, v in attrs.items()}
 
 
+def parse_pretokenized_chat_controls(
+    request, ds_attrs: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return chat controls retained alongside an already-tokenized prompt.
+
+    DashScope sends the rendered ``input_ids`` to RTP-LLM, so the ordinary
+    OpenAI renderer never sees the request-level tool contract.  Preserve the
+    semantic controls that a model renderer needs to build its decoding
+    grammar.  Explicit ``ds_header_attributes`` wins; ``parameters['payload']``
+    is the compatibility fallback used by older forwarders.
+    """
+    attrs = ds_attrs if ds_attrs is not None else parse_ds_header_attributes(request)
+    controls: dict[str, Any] = {}
+    for name in ("tools", "tool_choice", "parallel_tool_calls"):
+        value = _lookup_ds_request_control(attrs, name)
+        if value is not None:
+            controls[name] = value
+
+    if "tools" in controls:
+        return controls
+    payload = _load_multimodal_payload(request)
+    if not isinstance(payload, dict):
+        return controls
+    parameters = payload.get("parameters")
+    if not isinstance(parameters, dict):
+        return controls
+    for name in ("tools", "tool_choice", "parallel_tool_calls"):
+        if name not in controls and name in parameters:
+            controls[name] = parameters[name]
+    return controls
+
+
 def _dict_get_case_insensitive(value: Any, key: str) -> Any:
     if not isinstance(value, dict):
         return None

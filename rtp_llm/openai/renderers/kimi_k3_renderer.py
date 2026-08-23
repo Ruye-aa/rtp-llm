@@ -5,6 +5,7 @@ import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import torch
@@ -923,6 +924,48 @@ class KimiK3Renderer(CustomChatRenderer):
                 "structural_tag": cls.pretokenized_chat_structural_tag(False),
             },
         }
+
+    @classmethod
+    def apply_pretokenized_chat_request_constraints(
+        cls,
+        controls: Dict[str, Any],
+        generate_config: GenerateConfig,
+        thinking: bool,
+    ) -> Optional[str]:
+        """Apply the same full XTML grammar used by the OpenAI request path.
+
+        The prompt is already tokenized, but DashScope retains ``tools`` and
+        ``tool_choice`` in request metadata.  A model-owned hook keeps the
+        generic DashSC path free of K3 token or channel assumptions and avoids
+        replacing a caller-supplied structural tag.
+        """
+        if generate_config.structural_tag is not None:
+            return None
+        tools = controls.get("tools")
+        tool_choice = controls.get("tool_choice")
+        if not isinstance(tools, list) or not tools or tool_choice == "none":
+            return None
+
+        request = SimpleNamespace(
+            messages=[],
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        if cls._tool_choice_forces_tool(request):
+            cls._clear_grammar_constraints(generate_config)
+        response_content = cls._response_content_format(generate_config)
+        structural_tag = cls._build_k3_structural_tag(
+            request, response_content, thinking
+        )
+        cls._clear_grammar_constraints(generate_config)
+        generate_config.structural_tag = json.dumps(
+            structural_tag, ensure_ascii=False, separators=(",", ":")
+        )
+        generate_config.in_think_mode = False
+        generate_config.begin_think_token_ids = []
+        generate_config.end_think_token_ids = []
+        generate_config.max_thinking_tokens = 0
+        return "pretokenized_request_tools"
 
     @staticmethod
     def _template_kwargs(

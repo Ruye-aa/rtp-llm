@@ -25,6 +25,7 @@ from rtp_llm.dash_sc.codec import (
     parse_input_ids_from_request,
     parse_multimodal_parts_from_request,
     parse_other_params,
+    parse_pretokenized_chat_controls,
     parse_sampling_params,
     prepend_to_generated_ids_tensor,
 )
@@ -123,6 +124,56 @@ def _add_tensor(
 
 
 class DashScGrpcRequestTest(TestCase):
+    def test_parse_pretokenized_chat_controls_from_dashscope_payload(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        req.parameters["ds_header_attributes"].string_param = json.dumps(
+            {
+                "payload": {
+                    "parameters": {
+                        "tools": tools,
+                        "tool_choice": "auto",
+                        "parallel_tool_calls": True,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(
+            parse_pretokenized_chat_controls(req),
+            {
+                "tools": tools,
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
+            },
+        )
+
+    def test_parse_pretokenized_chat_controls_falls_back_to_payload_parameter(
+        self,
+    ) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        req.parameters["payload"].string_param = json.dumps(
+            {
+                "parameters": {
+                    "tools": [{"type": "function", "function": {"name": "bash"}}],
+                    "tool_choice": "required",
+                }
+            }
+        )
+
+        controls = parse_pretokenized_chat_controls(req)
+
+        self.assertEqual(controls["tool_choice"], "required")
+        self.assertEqual(controls["tools"][0]["function"]["name"], "bash")
+
     def test_parse_input_ids_int32(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
         raw = struct.pack("<3i", 10, 20, 30)

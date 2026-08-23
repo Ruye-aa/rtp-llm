@@ -22,6 +22,74 @@ class KimiK3RendererTest(unittest.TestCase):
             enable_thinking=enable_thinking,
         )
 
+    @staticmethod
+    def bash_tool() -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a bash command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+
+    def test_pretokenized_tool_metadata_selects_full_xtml_grammar(self) -> None:
+        config = GenerateConfig(
+            in_think_mode=True,
+            max_thinking_tokens=1048576,
+            response_format={"type": "text"},
+        )
+
+        source = KimiK3Renderer.apply_pretokenized_chat_request_constraints(
+            {"tools": [self.bash_tool()], "tool_choice": "auto"},
+            config,
+            thinking=True,
+        )
+
+        self.assertEqual(source, "pretokenized_request_tools")
+        tag = json.loads(config.structural_tag)
+        encoded = json.dumps(tag, ensure_ascii=False)
+        self.assertIn('<|open|>call tool="bash" index="', encoded)
+        self.assertIn("kimi_k3_xml", encoded)
+        self.assertIn("<|open|>tools<|sep|>", encoded)
+        self.assertFalse(config.in_think_mode)
+        self.assertEqual(config.end_think_token_ids, [])
+        self.assertEqual(config.max_thinking_tokens, 0)
+
+    def test_pretokenized_without_active_tools_keeps_common_fallback(self) -> None:
+        config = GenerateConfig(in_think_mode=True, max_thinking_tokens=1048576)
+
+        source = KimiK3Renderer.apply_pretokenized_chat_request_constraints(
+            {"tools": [self.bash_tool()], "tool_choice": "none"},
+            config,
+            thinking=True,
+        )
+
+        self.assertIsNone(source)
+        self.assertIsNone(config.structural_tag)
+        self.assertTrue(config.in_think_mode)
+
+    def test_pretokenized_required_tool_supersedes_response_format(self) -> None:
+        config = GenerateConfig(
+            in_think_mode=True,
+            response_format={"type": "json_object"},
+        )
+
+        KimiK3Renderer.apply_pretokenized_chat_request_constraints(
+            {"tools": [self.bash_tool()], "tool_choice": "required"},
+            config,
+            thinking=True,
+        )
+
+        tag = json.loads(config.structural_tag)
+        response = tag["format"]["elements"][1]
+        self.assertEqual(response["content"]["type"], "any_text")
+        self.assertIsNone(config.response_format)
+
     def test_thinking_xtml_is_split_across_stream_chunks(self) -> None:
         status = _KimiK3StreamStatus(self.request(enable_thinking=True))
         chunks = [
