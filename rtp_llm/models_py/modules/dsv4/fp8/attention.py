@@ -3507,12 +3507,8 @@ class AttentionFP8(nn.Module):
                     )
                 swa_prefix_pending = None
 
-            sm120_swa_kv = None
-            sm120_extra_kv = None
-            sm120_swa_indices = None
-            sm120_swa_lens = None
-            sm120_extra_indices = None
-            sm120_extra_lens = None
+            sm120_swa_kv = sm120_extra_kv = sm120_swa_indices = None
+            sm120_swa_lens = sm120_extra_indices = sm120_extra_lens = None
             sm120_extra_page_size = None
             if torch.cuda.get_device_capability(qkv.q.device)[0] == 12:
                 gather_width = wm.M - wm.N
@@ -3520,53 +3516,40 @@ class AttentionFP8(nn.Module):
                 sm120_swa_kv = workspace[:, wm.N :, :].contiguous().view(-1, D)
                 combined_2d = combined_indices.squeeze(1).to(torch.int64)
                 valid = combined_2d >= 0
-                request_ids = torch.div(
-                    combined_2d.clamp_min(0), wm.M, rounding_mode="floor"
-                )
+                request_ids = torch.div(combined_2d.clamp_min(0), wm.M,
+                                        rounding_mode="floor")
                 local_slots = torch.remainder(combined_2d.clamp_min(0), wm.M)
                 is_extra = valid & (local_slots < wm.N)
                 sm120_extra_lens = is_extra.sum(dim=1, dtype=torch.int32)
                 sm120_swa_lens = combined_lens.to(torch.int32) - sm120_extra_lens
                 extra_width = max(int(cmp_topk.shape[-1]), 1)
-                extra_cols = torch.arange(
-                    extra_width, device=qkv.q.device, dtype=torch.int64
-                ).unsqueeze(0)
+                extra_cols = torch.arange(extra_width, device=qkv.q.device,
+                                          dtype=torch.int64).unsqueeze(0)
                 extra_src = combined_2d[:, :extra_width]
                 extra_req = request_ids[:, :extra_width]
                 extra_local = local_slots[:, :extra_width]
-                sm120_extra_indices = (
-                    extra_req * wm.N + extra_local
-                ).to(torch.int32)
-                sm120_extra_indices.masked_fill_(
-                    extra_cols >= sm120_extra_lens.to(torch.int64).unsqueeze(1), 0
-                )
+                sm120_extra_indices = (extra_req * wm.N + extra_local).to(torch.int32)
+                sm120_extra_indices.masked_fill_(extra_cols >=
+                    sm120_extra_lens.to(torch.int64).unsqueeze(1), 0)
                 sm120_extra_indices.masked_fill_(extra_src < 0, 0)
                 aligned_extra_width = (extra_width + 63) // 64 * 64
                 if aligned_extra_width != extra_width:
-                    padded_extra = torch.full(
+                    padded_extra = torch.zeros(
                         (combined_2d.shape[0], aligned_extra_width),
-                        0,
-                        dtype=torch.int32,
-                        device=qkv.q.device,
-                    )
+                        dtype=torch.int32, device=qkv.q.device)
                     padded_extra[:, :extra_width] = sm120_extra_indices
                     sm120_extra_indices = padded_extra
-                swa_cols = torch.arange(
-                    self.window_size, device=qkv.q.device, dtype=torch.int64
-                ).unsqueeze(0)
+                swa_cols = torch.arange(self.window_size, device=qkv.q.device,
+                                        dtype=torch.int64).unsqueeze(0)
                 swa_src_cols = sm120_extra_lens.to(torch.int64).unsqueeze(1) + swa_cols
                 safe_cols = swa_src_cols.clamp_max(int(combined_2d.shape[1]) - 1)
                 swa_src = combined_2d.gather(1, safe_cols)
-                swa_req = torch.div(
-                    swa_src.clamp_min(0), wm.M, rounding_mode="floor"
-                )
+                swa_req = torch.div(swa_src.clamp_min(0), wm.M,
+                                    rounding_mode="floor")
                 swa_local = torch.remainder(swa_src.clamp_min(0), wm.M) - wm.N
-                sm120_swa_indices = (
-                    swa_req * gather_width + swa_local
-                ).to(torch.int32)
-                sm120_swa_indices.masked_fill_(
-                    swa_cols >= sm120_swa_lens.to(torch.int64).unsqueeze(1), 0
-                )
+                sm120_swa_indices = (swa_req * gather_width + swa_local).to(torch.int32)
+                sm120_swa_indices.masked_fill_(swa_cols >=
+                    sm120_swa_lens.to(torch.int64).unsqueeze(1), 0)
                 sm120_swa_indices.masked_fill_(swa_src < 0, 0)
                 sm120_extra_page_size = 64 if ratio == 4 else 2
             return self._flash_mla_sparse_fwd_chunked_projected(
@@ -5357,12 +5340,9 @@ class AttentionFP8(nn.Module):
         prefill_workspace: Optional[PrefillWorkspace],
         profile_name: str,
         out: Optional[torch.Tensor] = None,
-        sm120_swa_kv: Optional[torch.Tensor] = None,
-        sm120_extra_kv: Optional[torch.Tensor] = None,
-        sm120_swa_indices: Optional[torch.Tensor] = None,
-        sm120_swa_lens: Optional[torch.Tensor] = None,
-        sm120_extra_indices: Optional[torch.Tensor] = None,
-        sm120_extra_lens: Optional[torch.Tensor] = None,
+        sm120_swa_kv=None, sm120_extra_kv=None,
+        sm120_swa_indices=None, sm120_swa_lens=None,
+        sm120_extra_indices=None, sm120_extra_lens=None,
         sm120_extra_page_size: Optional[int] = None,
     ) -> torch.Tensor:
         """Run sparse prefill attention in Q chunks and project immediately.
@@ -5402,13 +5382,10 @@ class AttentionFP8(nn.Module):
         assert (
             int(indices.shape[0]) == s_q
         ), f"indices rows ({indices.shape[0]}) != Q rows ({s_q})"
-        assert topk_length.ndim == 1 and int(topk_length.shape[0]) == s_q, (
-            "topk_length must be one-dimensional with one entry per Q row; "
-            f"got shape {tuple(topk_length.shape)} for {s_q} Q rows"
-        )
-        assert (
-            int(freqs_cis.shape[0]) == s_q
-        ), f"RoPE rows ({freqs_cis.shape[0]}) != Q rows ({s_q})"
+        assert topk_length.ndim == 1 and int(topk_length.shape[0]) == s_q, \
+            f"invalid topk_length shape {tuple(topk_length.shape)} for {s_q} Q rows"
+        assert int(freqs_cis.shape[0]) == s_q, \
+            f"RoPE rows ({freqs_cis.shape[0]}) != Q rows ({s_q})"
 
         use_sm120 = torch.cuda.get_device_capability(q.device)[0] == 12
         sm120_cache = None
@@ -5421,41 +5398,24 @@ class AttentionFP8(nn.Module):
                 canonical_topk,
                 run as run_sm120_sparse_mla,
             )
-            logical_kv = (
-                sm120_swa_kv
-                if sm120_swa_kv is not None
-                else kv.reshape(-1, self.head_dim)
-            ).to(torch.bfloat16).contiguous()
+            logical_kv = (sm120_swa_kv if sm120_swa_kv is not None else
+                          kv.reshape(-1, self.head_dim)).to(torch.bfloat16).contiguous()
             token_count = int(logical_kv.shape[0])
-            sm120_cache = torch.zeros(
-                (max((token_count + 63) // 64, 1), 64, _DSV4_FP8_KV_ENTRY_BYTES),
-                dtype=torch.uint8,
-                device=q.device,
-            )
-            quantize_and_insert_k_cache(
-                logical_kv,
-                sm120_cache,
-                torch.arange(token_count, dtype=torch.int64, device=q.device),
-            )
+            sm120_cache = torch.zeros((max((token_count + 63) // 64, 1), 64,
+                _DSV4_FP8_KV_ENTRY_BYTES), dtype=torch.uint8, device=q.device)
+            quantize_and_insert_k_cache(logical_kv, sm120_cache,
+                torch.arange(token_count, dtype=torch.int64, device=q.device))
             if sm120_extra_kv is not None:
                 assert sm120_extra_page_size in (2, 64)
                 extra_page_size = int(sm120_extra_page_size)
                 extra_kv = sm120_extra_kv.to(torch.bfloat16).contiguous()
                 extra_tokens = int(extra_kv.shape[0])
-                sm120_extra_cache = torch.zeros(
-                    (
-                        max((extra_tokens + extra_page_size - 1) // extra_page_size, 1),
-                        extra_page_size,
-                        _DSV4_FP8_KV_ENTRY_BYTES,
-                    ),
-                    dtype=torch.uint8,
-                    device=q.device,
-                )
-                quantize_and_insert_k_cache(
-                    extra_kv,
-                    sm120_extra_cache,
-                    torch.arange(extra_tokens, dtype=torch.int64, device=q.device),
-                )
+                sm120_extra_cache = torch.zeros((max(
+                    (extra_tokens + extra_page_size - 1) // extra_page_size, 1),
+                    extra_page_size, _DSV4_FP8_KV_ENTRY_BYTES),
+                    dtype=torch.uint8, device=q.device)
+                quantize_and_insert_k_cache(extra_kv, sm120_extra_cache,
+                    torch.arange(extra_tokens, dtype=torch.int64, device=q.device))
         else:
             from flash_mla import flash_mla_sparse_fwd  # type: ignore[import-not-found]
 
