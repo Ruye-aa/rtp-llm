@@ -760,6 +760,24 @@ class KimiK3Renderer(CustomChatRenderer):
         config.structural_tag = None
         config.response_format = None
 
+    @staticmethod
+    def _clear_forced_tool_response_format(
+        request: ChatCompletionRequest, config: GenerateConfig
+    ) -> None:
+        response_format = request.response_format
+        if response_format is None or response_format.type == "text":
+            return
+
+        # A forced tool call has no assistant response body for response_format
+        # to constrain. The tool arguments are constrained by the selected
+        # function schema inside the K3 structural grammar instead.
+        config.json_format = False
+        config.json_schema = None
+        config.regex = None
+        config.ebnf = None
+        config.structural_tag = None
+        config.response_format = None
+
     @classmethod
     def _build_k3_structural_tag(
         cls,
@@ -1045,6 +1063,8 @@ class KimiK3Renderer(CustomChatRenderer):
         thinking = _thinking_enabled(request)
         self._apply_sampling_contract(request, generate_config, thinking)
 
+        if self._tool_choice_forces_tool(request):
+            self._clear_forced_tool_response_format(request, generate_config)
         response_content = self._response_content_format(generate_config)
         structural_tag = self._build_k3_structural_tag(
             request, response_content, thinking

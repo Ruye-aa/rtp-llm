@@ -531,7 +531,7 @@ class KimiK3RendererTest(unittest.TestCase):
                 "tools": [self._weather_tool()],
                 "tool_choice": "required",
                 "response_format": {"type": "json_object"},
-                "thinking": {"type": "disabled"},
+                "reasoning_effort": "max",
             }
         )
         renderer = KimiK3Renderer.__new__(KimiK3Renderer)
@@ -540,7 +540,20 @@ class KimiK3RendererTest(unittest.TestCase):
         renderer.apply_chat_completion_constraints(request, config)
 
         self.assertIsNone(config.json_schema)
-        self.assertIsNotNone(config.structural_tag)
+        elements = json.loads(config.structural_tag)["format"]["elements"]
+        self.assertEqual(elements[0]["end"], "<|close|>think<|sep|>")
+        self.assertEqual(
+            elements[1]["content"],
+            {"type": "any_text", "excludes": ["<|open|>", "<|close|>"]},
+        )
+        self.assertEqual(elements[2]["type"], "sequence")
+        call_schema = elements[2]["elements"][1]["tags"][0]["content"][
+            "elements"
+        ][2]
+        self.assertEqual(call_schema["type"], "json_schema")
+        self.assertEqual(
+            call_schema["json_schema"], self._weather_tool()["function"]["parameters"]
+        )
 
     def test_pending_generation_channel_is_excluded_from_usage(self) -> None:
         class Tokenizer:
