@@ -94,6 +94,16 @@ py_test(
 )
 
 py_test(
+    name = "flash_attn_utils_test",
+    srcs = [
+        "flash_attn_utils_test.py",
+    ],
+    deps = [
+        "//rtp_llm:utils",
+    ],
+)
+
+py_test(
     # Verifies load_tensor_slice / copy-out on a real ROCm build (hip asserted).
     name = "ckpt_database_test_rocm",
     srcs = ["ckpt_database_test.py"],
