@@ -262,8 +262,6 @@ class StrategySelectTest(unittest.TestCase):
             self.assertIn("Conflicting MoE strategy", str(cm.exception))
 
     def test_legacy_negation_does_not_force_alternative(self):
-        # DSV4_USE_MEGA_MOE=0 should not force a strategy. EP>1 may still
-        # select the SM120-capable DeepEP implementation.
         with _env(DSV4_USE_MEGA_MOE="0"):
             self.assertEqual(_resolve_forced(None), (None, False))
 

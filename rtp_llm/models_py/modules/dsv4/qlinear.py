@@ -125,9 +125,6 @@ class QuantizedLinear(nn.Module):
         self.scale = scale
         self.scale_gemm = scale_gemm
         if weight.is_cuda and torch.cuda.get_device_capability(weight.device)[0] == 12:
-            # DeepGEMM's packed scale layout is SM100-specific.  Keep the
-            # checkpoint's native MXFP4 scale on SM120; forward selects the
-            # portable reference until the fused CUTLASS executor is used.
             self.scale_gemm = None
             return
         if self.scale_gemm is None:

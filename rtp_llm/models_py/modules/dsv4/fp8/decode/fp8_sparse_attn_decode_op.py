@@ -114,7 +114,6 @@ class SparseAttnV4DecodeFp8Op:
                 extra_topk_idxs,
                 extra_topk_length,
             )
-
         assert _FLASH_MLA_AVAILABLE, (
             "flash_mla wheel is required for FP8 sparse decode "
             "(install rtp_llm with cuda12_9 / cuda13 config)"
@@ -132,14 +131,6 @@ class SparseAttnV4DecodeFp8Op:
             extra_topk_idxs,
             extra_topk_length,
         )
-
-    @classmethod
-    def _get_sm120_workspace(cls, device: torch.device) -> torch.Tensor:
-        # Kept as a compatibility shim for existing focused tests.
-        from rtp_llm.models_py.modules.dsv4.fp8.sm120_sparse_mla import workspace
-
-        return workspace(device)
-
     def _forward_sm120_flashinfer(
         self,
         q: torch.Tensor,
@@ -151,14 +142,12 @@ class SparseAttnV4DecodeFp8Op:
         extra_topk_idxs: Optional[torch.Tensor] = None,
         extra_topk_length: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """SM120 packed sparse MLA through FlashInfer (vLLM main parity)."""
         from rtp_llm.models_py.modules.dsv4.fp8.sm120_sparse_mla import (
             canonical_topk,
             pack_logical_workspace,
             run,
             token_lens,
         )
-
         batch, q_len, heads, dim = q.shape
         rows = batch * q_len
         swa_indices = topk_idxs.squeeze(2) if topk_idxs.dim() == 4 else topk_idxs
@@ -166,33 +155,22 @@ class SparseAttnV4DecodeFp8Op:
             swa_indices.reshape(rows, -1),
             topk_length,
             (128, 512, 1024),
-            # DSpark reserves a 256-column CUDA-graph buffer, but MTP can
-            # make 132 entries valid.  Trimming that buffer to 128 leaves
-            # swa_topk_lens larger than the index row and drops four real KV
-            # entries.  Preserve all 256 columns and pad to FlashInfer's next
-            # instantiated Top-K shape instead.
-            trim_dspark_padding=False,
-            pad_to_supported=True,
         )
         extra_indices = extra_topk_idxs
         if extra_indices is not None and extra_indices.dim() == 4:
             extra_indices = extra_indices.squeeze(2)
         if extra_indices is not None:
             extra_indices = extra_indices.reshape(rows, -1).to(torch.int32).contiguous()
-
         swa_decode_cache, swa_indices = pack_logical_workspace(
             kv_cache, swa_indices, page_size=64
         )
         if extra_k_cache is not None and extra_indices is not None:
-            # FlashInfer instantiates the extra pool at Page2 (native HCA) or
-            # Page64. RTP's original CSA/HCA layout is adapted only here.
             extra_page_size = 2 if int(extra_k_cache.shape[1]) <= 2 else 64
             extra_decode_cache, extra_indices = pack_logical_workspace(
                 extra_k_cache, extra_indices, page_size=extra_page_size
             )
         else:
             extra_decode_cache = None
-
         flat_q = q.reshape(batch * q_len, heads, dim).contiguous()
         flat_out = torch.empty_like(flat_q)
         run(

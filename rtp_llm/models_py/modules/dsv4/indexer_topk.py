@@ -285,10 +285,6 @@ class AutoIndexerTopKBackend(IndexerTopKBackend):
     ) -> torch.Tensor:
         if int(topk) <= 0 or score.shape[-1] == 0:
             return self._torch.select(score, topk, lengths=lengths, offset=offset)
-        # The legacy fast_topk_v2 binary cannot be loaded on Blackwell SM120,
-        # while the vLLM-derived persistent kernel is compiled for and runs on
-        # SM120.  It also implements the per-row lengths/-1 padding contract,
-        # so prefer it before the historical full-row-only policy below.
         if (
             score.is_cuda
             and score.dtype == torch.float32

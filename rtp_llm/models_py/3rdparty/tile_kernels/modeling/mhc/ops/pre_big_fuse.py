@@ -24,9 +24,6 @@ def _compute_num_split(block_k: int, k: int, grid_size: int) -> int:
 def _requested_backend() -> str:
     requested = os.environ.get("DSV4_MHC_PRE_GEMM_BACKEND", "").strip().lower()
     if requested in ("", "auto"):
-        # DeepGEMM's hyperconnection recipe supports Hopper/SM100 but rejects
-        # consumer Blackwell (SM120).  The vendored TileLang kernel implements
-        # the same TF32 prenorm GEMM and is compiled for the active device.
         capability = torch.cuda.get_device_capability()
         return "tilelang_single" if capability[0] >= 12 else "deepgemm"
     aliases = {

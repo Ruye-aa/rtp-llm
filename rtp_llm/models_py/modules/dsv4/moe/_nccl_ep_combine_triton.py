@@ -1,12 +1,7 @@
-"""Fused MXFP8 dequantization and peer reduction for SM120 NCCL EP."""
-
 from __future__ import annotations
-
 import torch
 import triton
 import triton.language as tl
-
-
 @triton.jit
 def _mxfp8_peer_sum_kernel(
     payload_ptr,
@@ -23,7 +18,6 @@ def _mxfp8_peer_sum_kernel(
     cols = block * BLOCK_D + tl.arange(0, BLOCK_D)
     mask = cols < hidden_size
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-
     for peer in tl.static_range(world_size):
         peer_row = peer * n_rows + row
         base = peer_row.to(tl.int64) * payload_cols
@@ -37,17 +31,13 @@ def _mxfp8_peer_sum_kernel(
         )
         scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
         acc += q * scale
-
     tl.store(output_ptr + row.to(tl.int64) * hidden_size + cols, acc, mask=mask)
-
-
 def mxfp8_dequant_peer_sum(
     returned_payload: torch.Tensor,
     n_rows: int,
     hidden_size: int,
     world_size: int,
 ) -> torch.Tensor:
-    """Dequantize fixed peer blocks and sum them directly into FP32 output."""
     if returned_payload.dtype != torch.uint8 or not returned_payload.is_contiguous():
         raise ValueError("returned_payload must be contiguous uint8")
     scale_cols = hidden_size // 32

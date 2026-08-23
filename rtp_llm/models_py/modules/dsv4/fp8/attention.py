@@ -152,16 +152,8 @@ from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import (
 
 
 def _swa_block_table_tokens_per_block(kv_cache: Any) -> int:
-    """Framework logical block-table row coverage, independent of CP slicing."""
     from rtp_llm.models_py.modules.dsv4.attn_type import SWA_KV
-
-    # CP-sharded fixed/SWA groups deliberately use a wider block-table row
-    # than the framework scalar (CP4: 1024 vs 256 tokens).  Using the scalar
-    # indexes long prompts into non-existent columns and silently drops the
-    # request tail from the SWA write mapping.
     return _dsv4_pool_tokens_per_block(kv_cache, region=int(SWA_KV))
-
-
 # Phase-Z (post-revert): overlap the prefill CP all-gather with same-layer
 # default-stream compute (SWA write for HCA; SWA write + indexer for CSA).
 # Default OFF — the baseline ``_forward_prefill_compressed`` / per-ratio
@@ -258,10 +250,6 @@ def _build_suffix_pool_slot_mapping(
     valid_pos = (step.unsqueeze(0) < gather_lens_l.unsqueeze(1)) & (abs_pos >= 0)
 
     block_in_seq = abs_pos // int(tokens_per_block_for_block_table)
-    # Reuse continuation may provide a compact block-table whose column zero
-    # represents the first retained suffix block (for example only logical
-    # block 7 of an eight-block, 2048-token hit).  Cold/full tables remain
-    # absolute.  Detect the compact form per request and rebase only then.
     bt_long = block_table[:B].to(device=device, dtype=torch.long)
     allocated_blocks = (bt_long > 0).sum(dim=1)
     expected_blocks = torch.div(
@@ -282,7 +270,6 @@ def _build_suffix_pool_slot_mapping(
     max_blocks = int(block_table.shape[1])
     in_capacity = valid_pos & (table_block >= 0) & (table_block < max_blocks)
     safe_block = torch.where(in_capacity, table_block, torch.zeros_like(table_block))
-
     req = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1)
     block_id = bt_long[req, safe_block]
     valid = in_capacity & (block_id > 0)
@@ -459,7 +446,6 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
     from rtp_llm.models_py.modules.dsv4.utils import (
         _enable_sm120_cached_weight_scale,
     )
-
     return _enable_sm120_cached_weight_scale(linear)
 
 
@@ -2085,13 +2071,11 @@ class AttentionFP8(nn.Module):
         R = self.o_lora_rank
         if torch.cuda.get_device_capability(o_fp8.device)[0] == 12:
             from flashinfer.gemm import gemm_fp8_nt_groupwise
-
             def _ue8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
                 scale_bytes = scale.contiguous().view(torch.uint8).reshape(
                     *scale.shape[:-1], -1
                 )
                 return (scale_bytes.to(torch.int32) - 127).float().exp2()
-
             padded_m = (M + 3) & ~3
             a = torch.zeros((G, padded_m, _K), dtype=o_fp8.dtype, device=o_fp8.device)
             a[:, :M].copy_(o_fp8.transpose(0, 1))
@@ -2116,7 +2100,6 @@ class AttentionFP8(nn.Module):
                 dim=0,
             )
             return projected[:, :M].transpose(0, 1).contiguous().view(B, S, G, R)
-
         out = torch.empty(M, G, R, dtype=torch.bfloat16, device=o_fp8.device)
         deep_gemm.fp8_einsum(
             "bhr,hdr->bhd",
@@ -3532,14 +3515,9 @@ class AttentionFP8(nn.Module):
             sm120_extra_lens = None
             sm120_extra_page_size = None
             if torch.cuda.get_device_capability(qkv.q.device)[0] == 12:
-                # FlashInfer's SM120 ABI keeps the Page64 SWA cache separate
-                # from the compressed cache.  RTP's persistent pools and the
-                # logical BF16 workspace remain unchanged; only this transient
-                # model-forward view is split and re-indexed.
                 gather_width = wm.M - wm.N
                 sm120_extra_kv = workspace[:, : wm.N, :].contiguous().view(-1, D)
                 sm120_swa_kv = workspace[:, wm.N :, :].contiguous().view(-1, D)
-
                 combined_2d = combined_indices.squeeze(1).to(torch.int64)
                 valid = combined_2d >= 0
                 request_ids = torch.div(
@@ -3549,7 +3527,6 @@ class AttentionFP8(nn.Module):
                 is_extra = valid & (local_slots < wm.N)
                 sm120_extra_lens = is_extra.sum(dim=1, dtype=torch.int32)
                 sm120_swa_lens = combined_lens.to(torch.int32) - sm120_extra_lens
-
                 extra_width = max(int(cmp_topk.shape[-1]), 1)
                 extra_cols = torch.arange(
                     extra_width, device=qkv.q.device, dtype=torch.int64
@@ -3574,7 +3551,6 @@ class AttentionFP8(nn.Module):
                     )
                     padded_extra[:, :extra_width] = sm120_extra_indices
                     sm120_extra_indices = padded_extra
-
                 swa_cols = torch.arange(
                     self.window_size, device=qkv.q.device, dtype=torch.int64
                 ).unsqueeze(0)
@@ -3593,7 +3569,6 @@ class AttentionFP8(nn.Module):
                 )
                 sm120_swa_indices.masked_fill_(swa_src < 0, 0)
                 sm120_extra_page_size = 64 if ratio == 4 else 2
-
             return self._flash_mla_sparse_fwd_chunked_projected(
                 q=qkv.q,
                 kv=kv_view,
@@ -5446,10 +5421,6 @@ class AttentionFP8(nn.Module):
                 canonical_topk,
                 run as run_sm120_sparse_mla,
             )
-
-            # Keep RTP's persistent cache and unified logical workspace unchanged.
-            # SM120 only repages that model-forward view into FlashInfer's transient
-            # Page64 layout, including compressed, SWA-ring, and current-token KV.
             logical_kv = (
                 sm120_swa_kv
                 if sm120_swa_kv is not None
@@ -5533,7 +5504,6 @@ class AttentionFP8(nn.Module):
                     from rtp_llm.models_py.modules.dsv4.fp8._trap_utils import (
                         validate_slot_mapping,
                     )
-
                     validate_slot_mapping(
                         "sm120.prefill.swa_indices",
                         chunk_indices,
@@ -5541,9 +5511,6 @@ class AttentionFP8(nn.Module):
                         num_blocks=int(sm120_cache.shape[0]),
                         negative_mode="skip_minus_one",
                     )
-                    # FlashInfer uses the explicit top-k length for masking,
-                    # but vectorized loads still require every tail address to
-                    # be a valid cache slot (vLLM zero-initializes this buffer).
                     chunk_indices.clamp_min_(0)
                     o_part = torch.empty_like(q[start:end])
                     run_sm120_sparse_mla(

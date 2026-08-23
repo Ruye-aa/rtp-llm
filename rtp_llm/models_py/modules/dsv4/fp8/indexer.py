@@ -95,9 +95,6 @@ def _fp8_prefill_fast_topk_enabled(logits: torch.Tensor | None = None) -> bool:
         and logits.is_cuda
         and torch.cuda.get_device_capability(logits.device)[0] == 12
     ):
-        # fast_topk_v2_variable uses an invalid launch configuration on SM120.
-        # The vLLM-vendored per-row radix/insertion kernel below is native CUDA
-        # and has full SM120 coverage, so select it rather than Torch Top-K.
         return False
     return os.environ.get("DSV4_PREFILL_FAST_TOPK", "1") != "0"
 
@@ -115,9 +112,6 @@ def _fp8_prefill_topk_use_torch(logits: torch.Tensor | None = None) -> bool:
             "DSV4_INDEXER_TOPK_BACKEND must be one of auto|cuda|torch, "
             f"got {backend!r}"
         )
-    # The prefill Top-K implementation is vendored from vLLM and compiled for
-    # the active CUDA architecture.  SM120 is supported by that kernel; do not
-    # route workstation Blackwell GPUs through the dense Torch mask/topk path.
     return False
 
 
@@ -128,10 +122,7 @@ def _fp8_prefill_topk_canonicalize() -> bool:
         "yes",
         "on",
     )
-
-
 def _canonicalize_prefill_topk_out(out: torch.Tensor) -> None:
-    """Sort valid cache offsets while preserving the ``valid..., -1...`` ABI."""
     sentinel = torch.iinfo(torch.int32).max
     sortable = torch.where(out >= 0, out, torch.full_like(out, sentinel))
     sorted_idx = torch.sort(sortable, dim=-1).values

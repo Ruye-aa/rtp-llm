@@ -181,10 +181,7 @@ class MegaMoEStrategy(RoutedExpertsStrategy):
 
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
-        # Mega's FP4 SF transform and symmetric-memory fused kernel are
-        # implemented for datacenter Blackwell (SM100), not SM120 RTX.
         import torch
-
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
             return False
         return cfg.ep_size > 1 and _mega_moe_enabled()

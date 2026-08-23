@@ -30,10 +30,7 @@ def _mode() -> str:
 def strict_fused_moe_enabled() -> bool:
     return os.environ.get("DSV4_MOE_STRICT_FUSED", "1") != "0"
 def _requires_sm120_linear(x: torch.Tensor) -> bool:
-    """DeepGEMM's shared-expert UE8M0 recipe is SM100-only."""
     return x.is_cuda and torch.cuda.get_device_capability(x.device)[0] == 12
-
-
 
 
 def _normalize_cuda_device(device: torch.device) -> torch.device | None:

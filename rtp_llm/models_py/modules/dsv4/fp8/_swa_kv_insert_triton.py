@@ -236,8 +236,6 @@ def _insert_packed_k_cache_flat_kernel(
     block = slot // cache_block_size
     pos = slot % cache_block_size
     block_ptr = cache_ptr + block * block_stride.to(tl.int64)
-    # Triton requires arange extents to be powers of two.  Use a 1024-wide
-    # vector and mask the 576-byte payload tail.
     data_offsets = tl.arange(0, 1024)
     data_mask = data_offsets < 576
     scale_offsets = tl.arange(0, 8)
@@ -250,19 +248,11 @@ def _insert_packed_k_cache_flat_kernel(
         block_ptr + cache_block_size * 576 + pos * 8 + scale_offsets,
         tl.load(packed_ptr + token * 584 + 576 + scale_offsets),
     )
-
-
 def insert_packed_k_cache_flat(
     packed: torch.Tensor,
     k_cache: torch.Tensor,
     slot_mapping: torch.Tensor | None = None,
 ) -> None:
-    """Copy logical ``[T,584]`` packed entries into a paged DSV4 cache.
-
-    This preserves the original FP8 payload and UE8M0 scales exactly while
-    converting from token-interleaved logical rows to the page layout whose
-    scale bytes live after all 576-byte token-data rows in each page.
-    """
     assert packed.ndim == 2 and packed.shape[1] == 584
     assert packed.dtype == torch.uint8 and packed.is_contiguous()
     assert k_cache.ndim == 3 and k_cache.shape[-1] == 584
@@ -292,8 +282,6 @@ def insert_packed_k_cache_flat(
         cache_block_size=int(k_cache.shape[1]),
         block_stride=int(k_cache.stride(0)),
     )
-
-
 def quantize_and_insert_k_cache_cp_byte_sliced(
     k: torch.Tensor,
     k_cache_raw: torch.Tensor,

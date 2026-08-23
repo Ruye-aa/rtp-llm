@@ -618,7 +618,6 @@ def _gather_k_cache_slots_packed_kernel(
     pos = safe_slot - block * cache_block_size
     block_ptr = pool_ptr + block * block_stride
     out_row = out_ptr + row * (token_data_size + scale_dim)
-
     data_off = tl.arange(0, 1024)
     data_mask = data_off < token_data_size
     data = tl.load(
@@ -627,7 +626,6 @@ def _gather_k_cache_slots_packed_kernel(
         other=0,
     )
     tl.store(out_row + data_off, data, mask=data_mask)
-
     scale_off = tl.arange(0, 8)
     scale_mask = scale_off < scale_dim
     scales = tl.load(
@@ -636,17 +634,9 @@ def _gather_k_cache_slots_packed_kernel(
         other=0,
     )
     tl.store(out_row + token_data_size + scale_off, scales, mask=scale_mask)
-
-
 def gather_k_cache_slots_packed(
     k_cache: torch.Tensor, slot_indices: torch.Tensor
 ) -> torch.Tensor:
-    """Gather arbitrary global slots into compact, bit-exact 584-byte rows.
-
-    Negative slots produce zero rows so speculative vector loads remain safe.
-    Unlike a BF16 dequant/requant adapter, this preserves the original FP8
-    payload and UE8M0 scale bytes exactly.
-    """
     assert k_cache.dim() == 3 and k_cache.shape[-1] == ENTRY_BYTES
     assert k_cache.dtype == torch.uint8
     assert k_cache.stride(2) == 1 and k_cache.stride(1) == ENTRY_BYTES
@@ -667,8 +657,6 @@ def gather_k_cache_slots_packed(
         scale_dim=SCALE_BYTES_PER_TOKEN,
     )
     return out
-
-
 @triton.jit
 def _dequantize_packed_k_cache_flat_kernel(
     out_ptr,

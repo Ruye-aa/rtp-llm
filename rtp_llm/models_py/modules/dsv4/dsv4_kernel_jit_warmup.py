@@ -810,10 +810,6 @@ def _collect_dsv4_dense_gemm_shapes(model: Any) -> Dict[tuple[str, int, int], di
             scale = getattr(module, "weight_scales", None)
             if weight is None or scale is None:
                 continue
-            # CudaFp8DeepGEMMLinear uses FlashInfer groupwise FP8 on SM120
-            # because DeepGEMM has no RTX recipe.  Do not
-            # prewarm a kernel that forward() will never call; TP-sharded
-            # projection shapes otherwise abort startup with "Unknown recipe".
             if (
                 weight.is_cuda
                 and torch.cuda.get_device_capability(weight.device)[0] == 12
@@ -1611,8 +1607,6 @@ def warmup_batched_fp8_einsum_jit(
     device = torch.device(device)
     if not _is_cuda_device(device) or not shapes:
         return
-    # DSV4's batched FP8 attention projections use FlashInfer groupwise FP8
-    # on SM120; DeepGEMM's scale-factor transformation has no RTX recipe.
     if torch.cuda.get_device_capability(device)[0] == 12:
         return
     _assert_not_capturing()
@@ -1880,9 +1874,6 @@ def warmup_fp8_mqa_logits_jit(
     device = torch.device(device)
     if not _is_cuda_device(device) or not shapes:
         return
-    # Runtime indexer scoring selects the SM120 reference because DeepGEMM's
-    # attention kernels reject consumer Blackwell.  Match that selection in
-    # startup prewarm.
     if torch.cuda.get_device_capability(device)[0] == 12:
         return
     if not _fp8_mqa_logits_available():

@@ -1,31 +1,3 @@
-"""Routed-expert strategy interface + registry.
-
-A *strategy* owns the per-rank routed-expert compute. The MoE layer drives
-``Gate`` (token → expert routing) and, normally, the *shared* expert; a fused
-strategy may own the shared expert too and return ``routed + shared``.
-
-The framework is intentionally NOT involved here — see
-``.claude/plans/optimized-riding-mist.md`` for why we keep this dsv4-internal
-rather than going through ``rtp_llm.models_py.modules.factory.fused_moe``.
-
-Strategies (priority high→low for ``forced=None``):
-
-    ep_size  env / kernel                 → strategy
-    --------------------------------------------------------
-    >1       DSV4_USE_MEGA_MOE_SE=1        MegaMoEStrategySE (strict)
-    >1       mega available + SM100        MegaMoEStrategy
-    >1       otherwise + DeepEP available  DeepEPStrategy
-    >1       no distributed strategy       RuntimeError
-    1        grouped FP4 kernel available  GroupedFP4Strategy
-    1        grouped unavailable           LocalLoopStrategy
-
-A model can override the auto-pick via:
-  - ``MoE(strategy="mega"|"grouped_fp4"|"local_loop"|"deepep")`` ctor kwarg
-  - ``DSV4_MOE_STRATEGY`` env var (overrides ctor kwarg)
-  - strict ``DSV4_USE_MEGA_MOE_SE=1`` fused-shared-expert opt-in
-  - legacy ``DSV4_USE_MEGA_MOE=0`` / ``DSV4_USE_GROUPED_FP4=0|1`` toggles
-    (translated to forced=... internally; conflicting toggles → RuntimeError)
-"""
 
 from __future__ import annotations
 
@@ -57,8 +29,6 @@ class MoeCfg:
     local_expert_start: int
     local_expert_end: int
     max_tokens_per_rank: int
-    # Effective attention TP size. CP deliberately reports 1 here because it
-    # repurposes the TP process group for sequence sharding.
     tp_size: int = 1
 
 
@@ -321,10 +291,6 @@ def select_strategy(
         mega_cls = next((c for c in _STRATEGY_PRIORITY if c.name == "mega"), None)
         if mega_cls is not None and mega_cls.can_handle(cfg):
             return mega_cls
-
-        # MegaMoE is the SM100/NVLink path. SM120 RTX cards have no NVLink,
-        # so fall back to explicit token dispatch/combine and local expert
-        # shard execution instead of selecting an incompatible kernel.
         deepep_cls = next((c for c in _STRATEGY_PRIORITY if c.name == "deepep"), None)
         if deepep_cls is not None and deepep_cls.can_handle(cfg):
             return deepep_cls

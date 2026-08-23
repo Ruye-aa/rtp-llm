@@ -80,9 +80,7 @@ class CompressedKPoolReader:
         block_table: torch.Tensor,
         block_size: int,
     ) -> torch.Tensor:
-        """Return request-concatenated logical entries without dequantizing."""
         raise NotImplementedError
-
 
 class LocalPoolReader(CompressedKPoolReader):
     def gather_packed(
@@ -113,7 +111,6 @@ class LocalPoolReader(CompressedKPoolReader):
                 offset=0,
             )
         return _pack_padded_to_flat(padded, effective_lens, total, ENTRY_BYTES)
-
     def fill(
         self,
         *,
@@ -262,7 +259,6 @@ class CPShardedPoolReader(CompressedKPoolReader):
 
         # Step 4: restore to request-concatenated logical order.
         self._restore_dequant_scatter(gathered, out, seq_lens, offset)
-
     def gather_packed(
         self,
         *,

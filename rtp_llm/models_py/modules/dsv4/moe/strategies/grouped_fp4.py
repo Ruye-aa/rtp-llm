@@ -160,11 +160,7 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
         s2_raw.copy_(stacked_w2_s)
         del stacked_w1_w, stacked_w1_s, stacked_w2_w, stacked_w2_s
         del stacked_w3_w, stacked_w3_s
-
         if is_sm120:
-            # CUTLASS SM120 block-scaled MMA consumes the native UE8M0 values
-            # in its 128x4 interleaved layout.  Each expert boundary is already
-            # 128-row aligned for V4, so a single flattened conversion is safe.
             from flashinfer import block_scale_interleave
             self._s13_sm120 = block_scale_interleave(
                 s13_raw.view(torch.uint8)
@@ -365,10 +361,8 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
         indices: torch.Tensor,
         input_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Launch-bounded SM120 path using Triton route scatter/gather."""
         from flashinfer import block_scale_interleave, mxfp8_quantize
         from flashinfer.gemm import group_gemm_mxfp4_nt_groupwise
-
         cfg = self.cfg
         n, d = x.shape
         e, inter = cfg.n_routed_experts, cfg.moe_inter_dim
@@ -384,7 +378,6 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
         total_rows = sum(aligned_list)
         if total_rows == 0:
             return torch.zeros((n, d), dtype=torch.float32, device=device)
-
         aligned = torch.tensor(
             aligned_list, dtype=torch.int32, pin_memory=True
         ).to(device, non_blocking=True)
@@ -395,13 +388,10 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
             )
         )
         expert_start = torch.empty_like(aligned)
-        # ep_scatter's metadata workspace is tiled in 128 rows; routed data
-        # itself remains only 4-row aligned for FlashInfer GEMM efficiency.
         m_indices = torch.empty(
             align(total_rows, 128), dtype=torch.int32, device=device
         )
         output_index = torch.empty_like(adjusted_ids)
-
         if input_scale is None:
             x_q, linear_scale = mxfp8_quantize(
                 x.contiguous(), is_sf_swizzled_layout=False
@@ -418,8 +408,6 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
             x_q, linear_scale, adjusted_ids, aligned, expert_start,
             routed_q, routed_scale, m_indices, output_index,
         )
-
-        # FlashInfer offsets each group's 128x4 scale layout independently.
         expert_ids = torch.bucketize(
             torch.arange(total_rows, device=device), indptr[1:], right=True
         )
@@ -429,27 +417,20 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
             sf_offsets[:-1] - indptr[:-1]
         ).index_select(0, expert_ids)
         sf_rows = int(sf_offsets[-1].item())
-
         def pack_scale(linear: torch.Tensor) -> torch.Tensor:
             padded = torch.zeros(
                 sf_rows, linear.size(1), dtype=torch.uint8, device=device
             )
             padded.index_copy_(0, scale_rows, linear)
             return block_scale_interleave(padded).reshape(sf_rows, linear.size(1))
-
         def gemm(inp_q, inp_scale, expert_weight, expert_scale):
             return group_gemm_mxfp4_nt_groupwise(
                 inp_q, expert_weight, pack_scale(inp_scale), expert_scale,
                 indptr, tile_n=128, out_dtype=torch.bfloat16,
             )
-
         gate_up = gemm(
             routed_q, routed_scale, self._w13.view(torch.uint8), self._s13_sm120
         )
-        # Preserve the legacy BF16 rounding point while fusing clamp, SiLU,
-        # multiply and MXFP8 quantization into one launch.  FlashInfer consumes
-        # one linear UE8M0 byte per 32 values; unpack the kernel's four-byte
-        # scale words with one compact layout copy before groupwise swizzling.
         up, gate = gate_up[:, :inter], gate_up[:, inter:]
         hidden_q, hidden_scale_packed = silu_mul_fp8_quant_packed_from_parts(
             gate, up, clamp_limit=cfg.swiglu_limit, group_size=FP4_BLOCK
@@ -463,29 +444,11 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
         output = torch.empty((n, d), dtype=torch.float32, device=device)
         ep_gather(down, adjusted_ids, weights, output_index, output)
         return output
-
-    def forward_sm120_mxfp8(
-        self,
-        x: torch.Tensor,
-        input_scale: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run SM120 grouped MoE from linear-layout MXFP8 activations."""
-        return self._forward_sm120(x, weights, indices, input_scale=input_scale)
-
-    def _get_sm120_fused_moe_workspace(
-        self, device: torch.device, max_tokens: Optional[int] = None
-    ) -> torch.Tensor:
+    def _get_sm120_fused_moe_workspace(self, device: torch.device) -> torch.Tensor:
         from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
         from flashinfer.fused_moe.core import ActivationType
-
         cfg = self.cfg
-        max_tokens = (
-            min(max(int(cfg.max_tokens_per_rank), 1), 512)
-            if max_tokens is None
-            else max(int(max_tokens), 1)
-        )
+        max_tokens = min(max(int(cfg.max_tokens_per_rank), 1), 512)
         key = (device.index, max_tokens, cfg.dim, cfg.moe_inter_dim,
                cfg.n_routed_experts, cfg.n_activated_experts)
         workspace = _SM120_FUSED_MOE_WORKSPACES.get(key)
@@ -504,18 +467,15 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
             )
             _SM120_FUSED_MOE_WORKSPACES[key] = workspace
         return workspace
-
     def _forward_capture_sm120(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Graph-safe fixed-shape fused path, warmed before capture."""
         from flashinfer import mxfp8_quantize
         from flashinfer.fused_moe import cutlass_fused_moe
         from flashinfer.fused_moe.core import ActivationType
-
         cfg = self.cfg
         num_experts = cfg.n_routed_experts
         fake_input_scale = torch.ones(
@@ -550,7 +510,6 @@ class GroupedFP4Strategy(RoutedExpertsStrategy):
             activation_type=ActivationType.Swiglu,
         )
         return output.float()
-
     def _forward_capture_topk(
         self,
         x: torch.Tensor,

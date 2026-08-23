@@ -1,5 +1,4 @@
 """Shared DSV4 utility functions used across BF16 and FP8 paths."""
-
 import os
 from types import MethodType
 
@@ -10,36 +9,49 @@ from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 
 _V4_FP8_BLOCK_CFG = Fp8BlockWiseQuantConfig()
-
-
-def _sm120_forward_quantized_cached_scale(
-    self, input_fp8: torch.Tensor, input_scales: torch.Tensor, output: torch.Tensor
+def _decode_ue8m0(scale: torch.Tensor, groups: int) -> torch.Tensor:
+    if scale.dtype != torch.int32:
+        return scale.float().contiguous()
+    raw = scale.contiguous().view(torch.uint8).reshape(*scale.shape[:-1], -1)
+    return (raw[..., :groups].to(torch.int32) - 127).float().exp2()
+def _sm120_forward_quantized(
+    self,
+    input_fp8: torch.Tensor,
+    input_scales: torch.Tensor,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """DSV4 SM120 FP8 GEMM with load-time decoded weight scales."""
     from flashinfer.gemm import gemm_fp8_nt_groupwise
-
-    if input_fp8.size(0) == 0:
+    rows, _ = self._validate_input(input_fp8)
+    output = self._prepare_output(input_fp8, rows, out)
+    if rows == 0:
         return output
-    a_scale = self._ue8m0_packed_to_fp32(
-        input_scales, (self.K + 127) // 128
-    )
-    gemm_fp8_nt_groupwise(
-        input_fp8.contiguous(),
+    padded = (rows + 3) & ~3
+    groups = (self.K + 127) // 128
+    a_scale = _decode_ue8m0(input_scales, groups)
+    if padded == rows:
+        a, gemm_out = input_fp8.contiguous(), output
+    else:
+        a = torch.zeros((padded, self.K), dtype=input_fp8.dtype, device=input_fp8.device)
+        a[:rows].copy_(input_fp8)
+        padded_scale = torch.ones((padded, groups), dtype=torch.float32, device=input_fp8.device)
+        padded_scale[:rows].copy_(a_scale)
+        a_scale, gemm_out = padded_scale, None
+    result = gemm_fp8_nt_groupwise(
+        a,
         self.weight,
         a_scale,
         self._dsv4_sm120_weight_scale_fp32,
         scale_granularity_mnk=(1, 128, 128),
         scale_major_mode="K",
-        out=output,
+        out=gemm_out,
         out_dtype=torch.bfloat16,
     )
+    if padded != rows:
+        output.copy_(result[:rows])
     if self.bias is not None:
         output.add_(self.bias.to(output.dtype))
     return output
-
-
 def _enable_sm120_cached_weight_scale(linear):
-    """Specialize a DSV4 FP8 linear without changing the factory class."""
     weight = getattr(linear, "weight", None)
     if (
         os.environ.get("DSV4_SM120_CACHE_FP8_SCALES", "1") == "0"
@@ -48,15 +60,11 @@ def _enable_sm120_cached_weight_scale(linear):
         or torch.cuda.get_device_capability(weight.device)[0] != 12
     ):
         return linear
-    weight_scale = linear._ue8m0_packed_to_fp32(
-        linear.weight_scales, (linear.K + 127) // 128
-    )
+    weight_scale = _decode_ue8m0(linear.weight_scales, (linear.K + 127) // 128)
     if weight_scale.size(0) == linear.N:
         weight_scale = weight_scale[::128]
     linear._dsv4_sm120_weight_scale_fp32 = weight_scale.contiguous()
-    linear._forward_quantized_sm120 = MethodType(
-        _sm120_forward_quantized_cached_scale, linear
-    )
+    linear.forward_quantized = MethodType(_sm120_forward_quantized, linear)
     return linear
 
 

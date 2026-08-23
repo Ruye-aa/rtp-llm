@@ -40,17 +40,12 @@ import torch
 # small ``align_bytes`` (e.g. 1) so the rounding does not force a 1 GiB host
 # allocation.
 _PREFILL_WS_ALIGN_BYTES = 1 << 30
-
-
 def resolve_prefill_workspace_rows(
-    configured_q_rows: int,
-    configured_full_rows: int,
-    live_q_rows: int,
-    cp_size: int,
+    configured_q_rows: int, configured_full_rows: int,
+    live_q_rows: int, cp_size: int,
     *,
     allow_dynamic_growth: bool,
 ) -> tuple[int, int]:
-    """Grow a forward's scratch only for the explicitly enabled SM120 path."""
     q_rows = int(configured_q_rows)
     full_rows = int(configured_full_rows)
     if not allow_dynamic_growth:

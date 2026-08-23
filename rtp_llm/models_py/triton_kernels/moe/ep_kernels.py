@@ -132,9 +132,6 @@ def ep_scatter(
     hidden_size = recv_x.shape[1]
     # grid = (triton.cdiv(hidden_size, BLOCK_D), num_experts)
     grid = num_experts
-    # Copy the physical scale row as supplied by the caller.  This keeps the
-    # scatter independent of the quantization block size (128 for DeepGEMM,
-    # 32 for FlashInfer MXFP8) and also covers packed UE8M0 int32 rows.
     scale_hidden_size = recv_x_scale.shape[1]
 
     assert m_indices.shape[0] % BLOCK_E == 0

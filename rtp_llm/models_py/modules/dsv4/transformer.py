@@ -250,12 +250,6 @@ class V4Transformer(nn.Module):
         self.capture_aux_hidden_layer_ids: tuple[int, ...] = ()
 
     def embed_full(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Return the full hidden embedding on every TP rank.
-
-        RTP's DSV4 checkpoint loader shards the embedding hidden dimension for
-        tensor parallelism. mHC is defined over the full model dimension, so
-        reconstruct the last dimension before expanding the HC streams.
-        """
         h = self.embed(input_ids)
         if h.size(-1) == self.args.dim:
             return h
@@ -266,7 +260,6 @@ class V4Transformer(nn.Module):
             )
         shard_count = self.args.dim // h.size(-1)
         from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
-
         leading = h.shape[:-1]
         local_dim = h.size(-1)
         flat = h.reshape(-1, local_dim).contiguous()
@@ -277,7 +270,6 @@ class V4Transformer(nn.Module):
             .contiguous()
             .view(*leading, self.args.dim)
         )
-
     def set_aux_hidden_capture_layer_ids(self, layer_ids: Sequence[int]) -> None:
         """Configure target residual-stream layers exported to DSpARK.
 
@@ -304,7 +296,6 @@ class V4Transformer(nn.Module):
         self.capture_aux_hidden_layer_ids = capture_ids
 
     def _ensure_mtp_hidden_capacity(self, rows: int) -> None:
-        """Grow CP-prefill DSpARK hand-off storage only for the opt-in SM120 path."""
         buf = self._mtp_hidden_buffer
         if buf is None or int(rows) <= int(buf.size(0)):
             return
@@ -315,8 +306,6 @@ class V4Transformer(nn.Module):
         )
         grown[: buf.size(0)].copy_(buf)
         self.register_buffer("_mtp_hidden_buffer", grown, persistent=False)
-
-
     def capture_aux_hidden(self, layer_id: int, hidden: torch.Tensor) -> None:
         """Write one selected layer's mean-pooled hidden into the shared
         runtime buffer.
