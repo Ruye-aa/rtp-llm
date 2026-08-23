@@ -144,12 +144,30 @@ void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_conte
                           k3MlaCacheTpEnvEnabled(),
                           grpc::StatusCode::INVALID_ARGUMENT,
                           "Prefill sent MLA cache TP shards but Decode KIMI_K3_MLA_CACHE_TP is disabled");
-        GRPC_RET_IF_ERROR(decode_context,
-                          allocate_request.input().generate_config().has_mla_cache_owner_rank(),
-                          grpc::StatusCode::INVALID_ARGUMENT,
-                          "K3 MLA cache TP requires explicit mla_cache_owner_rank");
-        decode_context.mla_cache_owner_rank =
-            allocate_request.input().generate_config().mla_cache_owner_rank().value();
+        const bool explicit_owner = allocate_request.input().generate_config().has_mla_cache_owner_rank();
+        if (kdaKtpDecodeEnabled(maga_init_params_.parallelism_config)) {
+            // In Decode DP8/KTP8 the RPC route is authoritative.  The explicit
+            // field remains a test/diagnostic assertion only; clients cannot use
+            // it to redirect cache payload to another DP worker.
+            decode_context.mla_cache_owner_rank = maga_init_params_.parallelism_config.dp_rank;
+            if (explicit_owner) {
+                GRPC_RET_IF_ERROR(
+                    decode_context,
+                    allocate_request.input().generate_config().mla_cache_owner_rank().value()
+                        == decode_context.mla_cache_owner_rank,
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "explicit MLA owner must match the Decode DP route; cross-rank owner override is forbidden");
+            }
+        } else {
+            // The legacy TP8/DP1 fan-in test selects which TP worker receives
+            // the full MLA cache, so it still needs an explicit worker rank.
+            GRPC_RET_IF_ERROR(decode_context,
+                              explicit_owner,
+                              grpc::StatusCode::INVALID_ARGUMENT,
+                              "K3 MLA cache TP on Decode TP requires explicit mla_cache_owner_rank");
+            decode_context.mla_cache_owner_rank =
+                allocate_request.input().generate_config().mla_cache_owner_rank().value();
+        }
         GRPC_RET_IF_ERROR(decode_context,
                           decode_context.mla_cache_layout_version == K3MlaCacheTpLayout::kLayoutVersion,
                           grpc::StatusCode::INVALID_ARGUMENT,
@@ -171,13 +189,6 @@ void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_conte
                               && decode_context.mla_cache_owner_rank < decode_context.mla_cache_shard_count,
                           grpc::StatusCode::INVALID_ARGUMENT,
                           "K3 MLA cache owner rank is outside the Decode TP group");
-        if (kdaKtpDecodeEnabled(maga_init_params_.parallelism_config)) {
-            GRPC_RET_IF_ERROR(
-                decode_context,
-                decode_context.mla_cache_owner_rank == maga_init_params_.parallelism_config.dp_rank,
-                grpc::StatusCode::INVALID_ARGUMENT,
-                "explicit MLA owner must match the Decode DP route; cross-rank owner override is forbidden");
-        }
     }
 
     const auto& cache_config = engine_->resourceContext().cache_manager->cacheConfig();
@@ -209,17 +220,25 @@ void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_conte
                                 decode_context.request_key.c_str(),
                                 decode_context.prefill_cache_dtype,
                                 static_cast<int32_t>(cache_config.dtype));
-        // K3 PD is equal-TP only.  Prefill rank i and decode rank i own the same
-        // KDA/MLA attention shard, so the state moves rank-to-rank with no
-        // re-slicing.  The removed P8->D1 fan-in instead required one decode rank
-        // to reassemble all 96 KDA heads, which is what forced the cache layout to
-        // reserve a full-head slot and pad every rank-local block up to it.
+        // KDA is rank-to-rank in both supported topologies. In the Decode KTP
+        // topology the physical KDA partition is KTP8 even though MLA attention
+        // uses global TP1; therefore compare Prefill TP against the effective KDA
+        // partition rather than blindly against Decode attention TP.
         const int decode_attention_tp = static_cast<int>(maga_init_params_.parallelism_config.get_attn_tp_size());
-        RTP_LLM_CHECK_WITH_INFO(decode_attention_tp == decode_context.prefill_attention_tp_size,
-                                "request [%s] K3 PD requires equal attention TP on both sides, got P%d->D%d",
+        const int decode_kda_tp = kdaKtpDecodeEnabled(maga_init_params_.parallelism_config) ?
+                                      static_cast<int>(maga_init_params_.parallelism_config.ktp_size) :
+                                      decode_attention_tp;
+        RTP_LLM_CHECK_WITH_INFO(isK3PdRankToRankContract(decode_context.prefill_attention_tp_size,
+                                                         decode_attention_tp,
+                                                         decode_kda_tp,
+                                                         decode_context.peer_addrs.size()),
+                                "request [%s] K3 PD requires P attention shards to match D KDA shards, "
+                                "got P-TP%d -> D-TP%d/KTP%d peers=%zu",
                                 decode_context.request_key.c_str(),
                                 decode_context.prefill_attention_tp_size,
-                                decode_attention_tp);
+                                decode_attention_tp,
+                                decode_kda_tp,
+                                decode_context.peer_addrs.size());
         for (const auto& spec : cache_config.cache_specs) {
             const auto* linear_spec = dynamic_cast<const LinearKVCacheSpec*>(spec.get());
             if (linear_spec == nullptr) {
@@ -234,9 +253,8 @@ void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_conte
                 decode_context.prefill_conv_state_dtype,
                 static_cast<int32_t>(linear_spec->ssm_state_dtype),
                 static_cast<int32_t>(linear_spec->conv_state_dtype));
-            // Equal TP was already asserted above, so the decode side always holds
-            // exactly its own 96/8 KDA heads.  The dropped branch existed only to
-            // let a TP1 decode accept the full 96 heads.
+            // Both baseline TP8 and target TP1/KTP8 hold exactly one 96/8 KDA
+            // shard per rank. No Decode rank reconstructs all 96 KDA heads.
             constexpr uint32_t kK3TotalLinearHeads = 96;
             constexpr uint32_t kK3LocalLinearHeads = kK3TotalLinearHeads / kK3PrefillAttentionTp;
             RTP_LLM_CHECK_WITH_INFO(linear_spec->local_num_k_heads == kK3LocalLinearHeads
@@ -247,12 +265,13 @@ void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_conte
                                     linear_spec->local_num_v_heads);
         }
         RTP_LLM_LOG_INFO("[K3_PD] request=%s cache_mapping=P%d_to_D%d peers=%zu physical_block=%zu "
-                         "kernel_block=%zu",
+                         "KTP=%d kernel_block=%zu",
                          decode_context.request_key.c_str(),
                          decode_context.prefill_attention_tp_size,
                          decode_attention_tp,
                          decode_context.peer_addrs.size(),
                          cache_config.seq_size_per_block,
+                         decode_kda_tp,
                          cache_config.kernel_seq_size_per_block);
     }
     if (maga_init_params_.parallelism_config.prefill_cp_config.kv_cache_sharded
@@ -288,7 +307,10 @@ void DecodeRpcServer::allocateResource(DecodeGenerateContext& decode_context) {
         input->generate_config->gen_timeline = true;
     }
     auto generate_stream              = engine_->makeStream(input);
-    decode_context.generation_epoch   = static_cast<uint64_t>(generate_stream->schedulerEnqueueTimeUs());
+    // Capture the immutable stream lifetime epoch before P->D load.  The
+    // scheduler enqueue timestamp changes after localGenerate() enqueues the
+    // stream and therefore cannot be used as a distributed shadow-cache key.
+    decode_context.generation_epoch   = generate_stream->generationEpoch();
     decode_context.request_timeout_ms = generate_stream->getTimeoutMs();
 
     // Set CanRun event so that handleWaiting() will execute initKVBlock()
@@ -501,16 +523,24 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(
     const bool  segmented_linear_cache =
         load_context.prefill_cp_size <= 1 && peer_addrs.size() > 1 && hasSegmentedLinearCacheGroup(cache_config);
     const int  decode_attention_tp = static_cast<int>(maga_init_params_.parallelism_config.get_attn_tp_size());
-    const bool equal_attention_tp  = segmented_linear_cache && decode_attention_tp > 1
-                                    && static_cast<size_t>(decode_attention_tp) == peer_addrs.size();
+    const int  decode_kda_tp = kdaKtpDecodeEnabled(maga_init_params_.parallelism_config) ?
+                                   static_cast<int>(maga_init_params_.parallelism_config.ktp_size) :
+                                   decode_attention_tp;
+    const bool rank_to_rank = segmented_linear_cache
+                              && isK3PdRankToRankContract(static_cast<int>(peer_addrs.size()),
+                                                         decode_attention_tp,
+                                                         decode_kda_tp,
+                                                         peer_addrs.size());
     // A segmented linear cache is head-sharded, so it can only be moved
     // rank-to-rank.  The removed P8->D1 fan-in pulled every prefill peer so one
     // decode rank could stitch all 96 segments together; with that gone an
     // unequal mapping must fail loudly instead of silently falling through to the
     // generic block split below, which would hand decode the wrong head slices.
-    RTP_LLM_CHECK_WITH_INFO(!segmented_linear_cache || equal_attention_tp,
-                            "K3 hybrid cache PD requires equal attention TP, got D%d with %zu prefill peers",
+    RTP_LLM_CHECK_WITH_INFO(!segmented_linear_cache || rank_to_rank,
+                            "K3 hybrid cache PD requires rank-to-rank KDA shards, got D-TP%d/KTP%d "
+                            "with %zu prefill peers",
                             decode_attention_tp,
+                            decode_kda_tp,
                             peer_addrs.size());
 
     if (load_context.mla_cache_shard_count > 0) {
@@ -528,7 +558,7 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequestForMla(
         for (const auto& addr : peer_addrs) {
             request.add_peer_addrs(addr);
         }
-    } else if (equal_attention_tp) {
+    } else if (rank_to_rank) {
         RTP_LLM_CHECK_WITH_INFO(index >= 0 && static_cast<size_t>(index) < peer_addrs.size(),
                                 "equal-TP K3 PD worker index %d outside ordered peer list size %zu",
                                 index,
@@ -581,14 +611,22 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequest(const LoadKVC
     const auto& cache_config        = engine_->resourceContext().cache_manager->cacheConfig();
     const bool  k3_hybrid_cache     = cache_config.use_mla && hasSegmentedLinearCacheGroup(cache_config);
     const int   decode_attention_tp = static_cast<int>(maga_init_params_.parallelism_config.get_attn_tp_size());
-    const bool  equal_attention_tp =
-        k3_hybrid_cache && decode_attention_tp > 1 && static_cast<size_t>(decode_attention_tp) == peer_addrs.size();
+    const int decode_kda_tp = kdaKtpDecodeEnabled(maga_init_params_.parallelism_config) ?
+                                  static_cast<int>(maga_init_params_.parallelism_config.ktp_size) :
+                                  decode_attention_tp;
+    const bool rank_to_rank = k3_hybrid_cache
+                              && isK3PdRankToRankContract(static_cast<int>(peer_addrs.size()),
+                                                         decode_attention_tp,
+                                                         decode_kda_tp,
+                                                         peer_addrs.size());
     // Same reason as constructRemoteLoadRequestForMla: without the removed
     // P8->D1 fan-in an unequal mapping would drop through to the generic block
     // split and give decode the wrong KDA head slices, silently.
-    RTP_LLM_CHECK_WITH_INFO(!k3_hybrid_cache || load_context.prefill_cp_size > 1 || equal_attention_tp,
-                            "K3 hybrid cache PD requires equal attention TP, got D%d with %zu prefill peers",
+    RTP_LLM_CHECK_WITH_INFO(!k3_hybrid_cache || load_context.prefill_cp_size > 1 || rank_to_rank,
+                            "K3 hybrid cache PD requires rank-to-rank KDA shards, got D-TP%d/KTP%d "
+                            "with %zu prefill peers",
                             decode_attention_tp,
+                            decode_kda_tp,
                             peer_addrs.size());
     if (load_context.prefill_cp_size > 1) {
         // CP-sharded prefill: pull from all peers (each holds 1/N RR shard)
@@ -597,7 +635,7 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequest(const LoadKVC
         for (const auto& addr : peer_addrs) {
             request.add_peer_addrs(addr);
         }
-    } else if (equal_attention_tp) {
+    } else if (rank_to_rank) {
         RTP_LLM_CHECK_WITH_INFO(index >= 0 && static_cast<size_t>(index) < peer_addrs.size(),
                                 "equal-TP K3 PD worker index %d outside ordered peer list size %zu",
                                 index,
@@ -985,7 +1023,9 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
     RTP_LLM_CHECK_WITH_INFO(peer_cnt > 0, "peer_addrs is empty");
 
     const bool mla_cache_tp_fan_in = load_context.mla_cache_shard_count > 0;
-    const int  decode_worker_rank = static_cast<int>(maga_init_params_.parallelism_config.get_attn_tp_rank());
+    const int decode_worker_rank = kdaKtpDecodeEnabled(maga_init_params_.parallelism_config) ?
+                                       static_cast<int>(maga_init_params_.parallelism_config.ktp_rank) :
+                                       static_cast<int>(maga_init_params_.parallelism_config.get_attn_tp_rank());
     if (mla_cache_tp_fan_in) {
         K3MlaCacheTpLayout layout(load_context.mla_cache_shard_count);
         (void)layout;
