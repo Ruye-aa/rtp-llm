@@ -37,7 +37,7 @@ def sm120_dsv4_perf(name, topology, phase, speculative = True):
         "--ep_size", str(degree),
         "--world_size", str(degree),
         "--use_deepep_moe", "1",
-        "--use_deepep_low_latency", "0" if prefill else "1",
+        "--use_deepep_low_latency", "0" if prefill or topology in ("tp4", "tp8") else "1",
         "--act_type", "BF16",
         "--fp8_kv_cache", "1",
         "--load_method", "fastsafetensors",
@@ -45,16 +45,18 @@ def sm120_dsv4_perf(name, topology, phase, speculative = True):
         "--max_context_batch_size", "1",
         "--frontend_server_count", "1",
         "--enable_cuda_graph",
-        "0" if prefill or topology == "cp8_dp8" or (speculative and cp_dp) else "1",
+        "0" if prefill else "1",
         "--decode_capture_config",
-        "1,2,3,4" if topology == "cp8_dp8" else
-        "1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96",
+        "1",
         "--reserver_runtime_mem_mb", "8192",
     ]
     if prefill and cp_dp:
         args += ["--cp_rotate_method", "ALL_GATHER"]
     if not prefill and speculative:
         args += [
+            # Every EP rank must execute the same target rounds.  Reusing a
+            # prefix on only a subset of DP ranks makes their schedules diverge.
+            "--generate_config", "{\\\"reuse_cache\\\":false,\\\"force_sp_accept\\\":true}",
             "--sp_type", "dspark",
             "--gen_num_per_cycle", "3",
             "--sp_model_type", "deepseek_v4_dspark",
@@ -84,6 +86,11 @@ def sm120_dsv4_perf(name, topology, phase, speculative = True):
         env["DSV4_CHUNK_TOKENS"] = "12288" if cp_dp else "4096"
     else:
         env["FLASHMLA_FORCE_HEAD64X2"] = "1"
+        env["ENABLE_DSPARK"] = "1" if speculative else "0"
+        env["GEN_NUM_PER_CIRCLE"] = "3"
+        env["LINEAR_STEP"] = "32"
+        if topology == "cp8_dp8":
+            env["DSV4_SM120_FIXED_EP_BATCH"] = "1"
     if prefill and cp_dp:
         env["DSV4_PREFILL_CP_OVERLAP"] = "1"
         env["PREFILL_CP_KV_CACHE_SHARDED"] = "1"
@@ -91,8 +98,11 @@ def sm120_dsv4_perf(name, topology, phase, speculative = True):
     # is substantially faster than host-staged copies on this topology; only
     # disable inter-node IB discovery.
     env["NCCL_IB_DISABLE"] = "1"
-    env["NCCL_MIN_P2P_NCHANNELS"] = "24"
-    env["NCCL_MAX_P2P_NCHANNELS"] = "24"
+    if topology in ("tp4", "tp8"):
+        env["NCCL_P2P_DISABLE"] = "1"
+    else:
+        env["NCCL_MIN_P2P_NCHANNELS"] = "24"
+        env["NCCL_MAX_P2P_NCHANNELS"] = "24"
 
     py_test(
         name = name,

@@ -1,5 +1,8 @@
 """Shared DSV4 utility functions used across BF16 and FP8 paths."""
 
+import os
+from types import MethodType
+
 import torch
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
 
@@ -7,6 +10,54 @@ from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 
 _V4_FP8_BLOCK_CFG = Fp8BlockWiseQuantConfig()
+
+
+def _sm120_forward_quantized_cached_scale(
+    self, input_fp8: torch.Tensor, input_scales: torch.Tensor, output: torch.Tensor
+) -> torch.Tensor:
+    """DSV4 SM120 FP8 GEMM with load-time decoded weight scales."""
+    from flashinfer.gemm import gemm_fp8_nt_groupwise
+
+    if input_fp8.size(0) == 0:
+        return output
+    a_scale = self._ue8m0_packed_to_fp32(
+        input_scales, (self.K + 127) // 128
+    )
+    gemm_fp8_nt_groupwise(
+        input_fp8.contiguous(),
+        self.weight,
+        a_scale,
+        self._dsv4_sm120_weight_scale_fp32,
+        scale_granularity_mnk=(1, 128, 128),
+        scale_major_mode="K",
+        out=output,
+        out_dtype=torch.bfloat16,
+    )
+    if self.bias is not None:
+        output.add_(self.bias.to(output.dtype))
+    return output
+
+
+def _enable_sm120_cached_weight_scale(linear):
+    """Specialize a DSV4 FP8 linear without changing the factory class."""
+    weight = getattr(linear, "weight", None)
+    if (
+        os.environ.get("DSV4_SM120_CACHE_FP8_SCALES", "1") == "0"
+        or weight is None
+        or not weight.is_cuda
+        or torch.cuda.get_device_capability(weight.device)[0] != 12
+    ):
+        return linear
+    weight_scale = linear._ue8m0_packed_to_fp32(
+        linear.weight_scales, (linear.K + 127) // 128
+    )
+    if weight_scale.size(0) == linear.N:
+        weight_scale = weight_scale[::128]
+    linear._dsv4_sm120_weight_scale_fp32 = weight_scale.contiguous()
+    linear._forward_quantized_sm120 = MethodType(
+        _sm120_forward_quantized_cached_scale, linear
+    )
+    return linear
 
 
 def _repack_v4_fp8_scale_to_int32(scale: torch.Tensor) -> torch.Tensor:
@@ -27,12 +78,13 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
     if s.dtype == torch.float8_e8m0fnu:
         s = _repack_v4_fp8_scale_to_int32(s)
     local = {"_w": w, "_s": s}
-    return LinearFactory.create_linear_from_weights(
+    linear = LinearFactory.create_linear_from_weights(
         local,
         "_w",
         "_s",
         quant_config=_V4_FP8_BLOCK_CFG,
     )
+    return _enable_sm120_cached_weight_scale(linear)
 
 
 def _v4_fp8_linear_from_dict(weights: dict, weight_key: str, scale_key: str):

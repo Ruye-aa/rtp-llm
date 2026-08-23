@@ -130,6 +130,17 @@ class DeepEPStrategy(RoutedExpertsStrategy):
                 )
             )
             if (
+                os.environ.get("DSV4_SM120_FIXED_EP_BATCH", "0") == "1"
+                and not replicated_tp_tokens
+                and self._sm120_grouped is not None
+                # Speculative decode has an equal, small token count on every
+                # DP rank.  Prefill/framework warmup does not, so it must keep
+                # the variable-size AllToAll path.
+                and x.size(0)
+                <= int(os.environ.get("DSV4_SM120_FIXED_EP_MAX_TOKENS", "4"))
+            ):
+                return self._forward_sm120_fixed_ep(x, weights, indices)
+            if (
                 not torch.cuda.is_current_stream_capturing()
                 and os.environ.get("DSV4_SM120_NCCL_EP", "1") != "0"
                 and not replicated_tp_tokens
@@ -227,6 +238,76 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             handle,
         )
         return y_combined.float()
+
+    def _forward_sm120_fixed_ep(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Two graph-safe AllReduces for equal DP rank batches.
+
+        NCCL AllGather/ReduceScatter stalls while the per-rank Python workers
+        capture their target-verify graphs.  AllReduce is already the proven
+        graph collective used by the TP path, so represent the gather and
+        scatter as rank-addressed slices of two fixed tensors instead.
+        """
+        dist = torch.distributed
+        group = dist.group.WORLD
+        world = dist.get_world_size(group)
+        rank = dist.get_rank(group)
+        n, d = x.shape
+        topk = indices.size(1)
+        x_bytes = d * x.element_size()
+        weight_bytes = topk * weights.element_size()
+        payload = torch.zeros(
+            (world, n, x_bytes + weight_bytes + topk * 4),
+            dtype=torch.uint8,
+            device=x.device,
+        )
+        local_payload = payload[rank]
+        local_payload[:, :x_bytes].copy_(x.contiguous().view(torch.uint8))
+        local_payload[:, x_bytes : x_bytes + weight_bytes].copy_(
+            weights.contiguous().view(torch.uint8).reshape(n, weight_bytes)
+        )
+        local_payload[:, x_bytes + weight_bytes :].copy_(
+            indices.to(torch.int32).contiguous().view(torch.uint8).reshape(n, topk * 4)
+        )
+        # NCCL graph capture does not reliably accept byte reductions on this
+        # driver stack.  Each rank owns disjoint slots, so a packed int32 SUM
+        # is bit-identical and uses NCCL's established graph-safe datatype.
+        dist.all_reduce(payload.view(torch.int32), op=dist.ReduceOp.SUM, group=group)
+        gathered = payload.view(world * n, -1)
+        all_x = (
+            gathered[:, :x_bytes]
+            .contiguous()
+            .view(x.dtype)
+            .reshape(world * n, d)
+        )
+        all_w = (
+            gathered[:, x_bytes : x_bytes + weight_bytes]
+            .contiguous()
+            .view(weights.dtype)
+            .reshape(world * n, topk)
+        )
+        all_i = (
+            gathered[:, x_bytes + weight_bytes :]
+            .contiguous()
+            .view(torch.int32)
+            .to(torch.int64)
+            .reshape(world * n, topk)
+        )
+        local_i = all_i - self.cfg.local_expert_start
+        valid = (local_i >= 0) & (local_i < self.cfg.n_local_experts)
+        local_w = all_w * valid.to(all_w.dtype)
+        local_i.clamp_(0, self.cfg.n_local_experts - 1)
+        partial = (
+            self._sm120_grouped._forward_capture_sm120(all_x, local_w, local_i)
+            .to(x.dtype)
+            .contiguous()
+        )
+        dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=group)
+        return partial.view(world, n, d)[rank].float()
 
     def _forward_sm120_all_to_all(
         self,

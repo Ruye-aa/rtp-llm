@@ -859,6 +859,7 @@ sm120_dsv4_perf(name = "v4_flash_sm120_cp4_prefill_8k_32k_perf", topology = "cp4
 sm120_dsv4_perf(name = "v4_flash_sm120_dp4_decode_8k_32k_perf", topology = "cp4_dp4", phase = "decode", speculative = False)
 sm120_dsv4_perf(name = "v4_flash_sm120_cp8_prefill_8k_32k_perf", topology = "cp8_dp8", phase = "prefill")
 sm120_dsv4_perf(name = "v4_flash_sm120_dp8_decode_8k_32k_perf", topology = "cp8_dp8", phase = "decode", speculative = False)
+sm120_dsv4_perf(name = "v4_flash_sm120_dp8_dspark_decode_8k_32k_perf", topology = "cp8_dp8", phase = "decode")
 sm120_dsv4_perf(name = "v4_flash_sm120_tp4_ep4_prefill_perf", topology = "tp4", phase = "prefill")
 sm120_dsv4_perf(name = "v4_flash_sm120_tp4_ep4_decode_8k_32k_perf", topology = "tp4", phase = "decode")
 sm120_dsv4_perf(name = "v4_flash_sm120_tp4_ep4_decode_8k_32k_nosp_perf", topology = "tp4", phase = "decode", speculative = False)
