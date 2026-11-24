@@ -2,7 +2,8 @@
 
 Proves on a physical H20 GPU (TP=1) with Qwen3-VL that:
 1. Baseline (RTP_LLM_DISABLE_STEP_OOM_ISOLATION=1): a single oversized
-   multimodal + long-prompt/logits request kills the backend replica.
+   long-prompt logits request (prompt_logprobs / calculate_loss) kills the
+   live Qwen3-VL backend replica.
 2. With fix enabled: after the identical single request triggers a real GPU OOM
    in NormalExecutor::process and is isolated cleanly, the exact same backend
    worker PID stays alive and serves subsequent multimodal and text requests
@@ -337,7 +338,6 @@ class SingleRequestGpuOomH20Test(unittest.TestCase):
 
     def _verify_baseline_crashes_on_single_oom(
         self,
-        oom_image_url: str,
         oom_specs: List[Tuple[int, Optional[int], Optional[int]]],
     ) -> Dict[str, Any]:
         server = self._start_qwen3_vl_server(
@@ -365,7 +365,7 @@ class SingleRequestGpuOomH20Test(unittest.TestCase):
             )
             status, body = self._post_chat_completion(
                 server.port,
-                oom_image_url,
+                None,
                 prompt_text,
                 max_tokens=1,
                 prompt_logprobs=prompt_lp,
@@ -426,9 +426,7 @@ class SingleRequestGpuOomH20Test(unittest.TestCase):
             time.sleep(0.5)
         return False
 
-    def _verify_fixed_isolates_oom_and_keeps_serving(
-        self, oom_image_url: str
-    ) -> Dict[str, Any]:
+    def _verify_fixed_isolates_oom_and_keeps_serving(self) -> Dict[str, Any]:
         server = self._start_qwen3_vl_server(
             role_name="qwen3_vl_oom_isolated",
             extra_env={},
@@ -464,7 +462,7 @@ class SingleRequestGpuOomH20Test(unittest.TestCase):
             )
             status, body = self._post_chat_completion(
                 server.port,
-                oom_image_url,
+                None,
                 prompt_text,
                 max_tokens=1,
                 prompt_logprobs=prompt_lp,
@@ -554,13 +552,10 @@ class SingleRequestGpuOomH20Test(unittest.TestCase):
 
     def test_single_request_gpu_oom_ab_acceptance_on_h20(self) -> None:
         gpu_mem_init = _query_gpu_memory_mib()
-        oom_image_url = _make_jpeg_data_url(320, 320, seed_offset=9)
 
-        scenario_b = self._verify_fixed_isolates_oom_and_keeps_serving(oom_image_url)
+        scenario_b = self._verify_fixed_isolates_oom_and_keeps_serving()
         winning_spec = tuple(scenario_b["winning_spec"])
-        scenario_a = self._verify_baseline_crashes_on_single_oom(
-            oom_image_url, [winning_spec]
-        )
+        scenario_a = self._verify_baseline_crashes_on_single_oom([winning_spec])
 
         report = {
             "model_path": self.model_path,
