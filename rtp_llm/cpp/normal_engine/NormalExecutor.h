@@ -90,6 +90,12 @@ protected:
     bool checkDeviceInput() const;
     void ensureModelInputsOnCuda(GptModelInputs& model_input, const char* tag);
     void checkModelInputsOnCuda(const GptModelInputs& model_input, const char* tag) const;
+    bool tryIsolateStepGpuOom(const std::list<GenerateStreamPtr>& streams,
+                              const std::exception&                 error,
+                              const char*                           stage,
+                              bool&                                 profile_started,
+                              bool                                  allow_multi_tp,
+                              bool&                                 worker_synced) noexcept;
 
 private:
     std::unique_ptr<ModelBase>                                               model_;
