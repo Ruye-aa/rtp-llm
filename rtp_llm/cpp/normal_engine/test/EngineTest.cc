@@ -2089,7 +2089,7 @@ TEST_F(NormalEngineTest, testSingleRequestGpuOomDoesNotCrashEngineAndServesSubse
     } reset_guard;
 
     auto engine = std::make_shared<NormalEngine>(params, nullptr);
-    const auto free_blocks_before = engine->resourceContext().cache_manager->freeBlockNums();
+    const auto free_blocks_before = engine->resourceContext().cache_manager->freeBlocksNum();
 
     auto make_query = [](std::initializer_list<int32_t> tokens) {
         auto query                             = std::make_shared<GenerateInput>();
@@ -2118,10 +2118,10 @@ TEST_F(NormalEngineTest, testSingleRequestGpuOomDoesNotCrashEngineAndServesSubse
     }
 
     // Wait briefly for scheduler's next tick to reap errored stream and release its KV blocks.
-    for (int i = 0; i < 50 && engine->resourceContext().cache_manager->freeBlockNums() < free_blocks_before; ++i) {
+    for (int i = 0; i < 50 && engine->resourceContext().cache_manager->freeBlocksNum() < free_blocks_before; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    EXPECT_EQ(engine->resourceContext().cache_manager->freeBlockNums(), free_blocks_before);
+    EXPECT_EQ(engine->resourceContext().cache_manager->freeBlocksNum(), free_blocks_before);
 
     // Request #3: subsequent normal request on the exact same engine succeeds cleanly.
     {
